@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+import re
 import pandas as pd
 import streamlit as st
 import yaml
@@ -292,12 +293,13 @@ with tab1:
         ),
     )
 
-# --- MODULE 2: UPLOAD & YAML CONVERTER ---
+# --- MODULE 2: UPLOAD, VALIDATE & YAML CONVERTER ---
 with tab2:
   st.subheader("Upload Excel Sheet, Validate & Build `streams.yml`")
   st.write(
       "Upload the completed Excel configuration sheet. The system will verify"
-      " all camera records before generating the YAML configuration."
+      " all mandatory camera fields, RTSP/RTMP URL formats, and overall data"
+      " integrity before generating files."
   )
 
   uploaded_file = st.file_uploader(
@@ -330,68 +332,124 @@ with tab2:
       )
 
       st.success(
-          "✅ Excel File Loaded Successfully! Found"
-          f" **{len(df)} camera streams**."
+          f"✅ Excel File Loaded Successfully! Found **{len(df)} camera"
+          " records**."
       )
 
-      # 1. Excel Preview Section
-      st.markdown("### 🔍 Step 1: Validate Excel Data")
-      st.dataframe(
-          df[[cam_col, rtsp_col, rtmp_col]].rename(
-              columns={
-                  cam_col: "Camera ID",
-                  rtsp_col: "RTSP Source URL",
-                  rtmp_col: "RTMP Target URL",
-              }
-          ),
-          use_container_width=True,
+      # 1. Preview Table
+      st.markdown("### 🔍 Step 1: Review Uploaded Data")
+      preview_df = df[[cam_col, rtsp_col, rtmp_col]].rename(
+          columns={
+              cam_col: "Camera Number",
+              rtsp_col: "RTSP Link",
+              rtmp_col: "RTMP URL",
+          }
       )
+      st.dataframe(preview_df, use_container_width=True)
 
-      # 2. Build YAML Object
+      # 2. Strict Validation Check
+      validation_errors = []
       streams_list = []
-      for _, row in df.iterrows():
+
+      if df.empty:
+        validation_errors.append("Uploaded file contains no data rows.")
+
+      for idx, row in df.iterrows():
+        row_num = idx + 2  # Excel row number considering 1-based index + header
+
         cam_id = (
-            str(row[cam_col]).strip() if pd.notna(row[cam_col]) else ""
+            str(row[cam_col]).strip()
+            if pd.notna(row[cam_col]) and str(row[cam_col]).strip() != "nan"
+            else ""
         )
         rtsp_url = (
-            str(row[rtsp_col]).strip() if pd.notna(row[rtsp_col]) else ""
+            str(row[rtsp_col]).strip()
+            if pd.notna(row[rtsp_col]) and str(row[rtsp_col]).strip() != "nan"
+            else ""
         )
         rtmp_url = (
-            str(row[rtmp_col]).strip() if pd.notna(row[rtmp_col]) else ""
+            str(row[rtmp_col]).strip()
+            if pd.notna(row[rtmp_col]) and str(row[rtmp_col]).strip() != "nan"
+            else ""
         )
 
-        stream_entry = {
-            "id": cam_id,
-            "source": rtsp_url,
-            "transport": "rtmp",
-            "target": rtmp_url,
-            "fallback": rtmp_url,
-            "srt_streamid": cam_id,
+        # Mandatory Field Checks
+        if not cam_id:
+          validation_errors.append(
+              f"Row {row_num}: **Camera Number** is blank."
+          )
+        if not rtsp_url:
+          validation_errors.append(f"Row {row_num}: **RTSP Link** is blank.")
+        if not rtmp_url:
+          validation_errors.append(f"Row {row_num}: **RTMP URL** is blank.")
+
+        # Protocol URL Structure Checks
+        if rtsp_url and not (
+            rtsp_url.lower().startswith("rtsp://")
+            or rtsp_url.lower().startswith("rtsps://")
+        ):
+          validation_errors.append(
+              f"Row {row_num}: Invalid **RTSP Link** format ('{rtsp_url}')."
+              " Must start with 'rtsp://' or 'rtsps://'."
+          )
+
+        if rtmp_url and not (
+            rtmp_url.lower().startswith("rtmp://")
+            or rtmp_url.lower().startswith("rtmps://")
+        ):
+          validation_errors.append(
+              f"Row {row_num}: Invalid **RTMP URL** format ('{rtmp_url}')."
+              " Must start with 'rtmp://' or 'rtmps://'."
+          )
+
+        if cam_id and rtsp_url and rtmp_url:
+          streams_list.append({
+              "id": cam_id,
+              "source": rtsp_url,
+              "transport": "rtmp",
+              "target": rtmp_url,
+              "fallback": rtmp_url,
+              "srt_streamid": cam_id,
+          })
+
+      # 3. Validation Results Handling
+      if validation_errors:
+        st.error("❌ Validation Failed! Please fix the errors below in Excel:")
+        for err in validation_errors:
+          st.write(f"- {err}")
+        st.warning(
+            "⚠️ **YAML generation is blocked** until all mandatory fields are"
+            " filled and valid."
+        )
+
+      else:
+        st.success(
+            "🎉 All fields validated successfully! No blank cells or malformed"
+            " URLs found."
+        )
+
+        yaml_data = {
+            "server": {"listen": "127.0.0.1:8080", "log_level": "info"},
+            "defaults": {
+                "rtsp_transport": "tcp",
+                "srt_latency_ms": 200,
+                "srt_connect_timeout_ms": 3000,
+                "srt_payload_size": 1316,
+                "on_stall_restart_s": 15,
+                "startup_timeout_s": 10,
+                "restart_backoff_base_s": 1,
+                "restart_backoff_max_s": 60,
+                "healthy_reset_s": 60,
+                "srt_failure_threshold": 3,
+                "rtmp_hold_s": 60,
+                "rtmp_hold_max_s": 600,
+                "kill_grace_s": 5,
+            },
+            "streams": streams_list,
         }
-        streams_list.append(stream_entry)
 
-      yaml_data = {
-          "server": {"listen": "127.0.0.1:8080", "log_level": "info"},
-          "defaults": {
-              "rtsp_transport": "tcp",
-              "srt_latency_ms": 200,
-              "srt_connect_timeout_ms": 3000,
-              "srt_payload_size": 1316,
-              "on_stall_restart_s": 15,
-              "startup_timeout_s": 10,
-              "restart_backoff_base_s": 1,
-              "restart_backoff_max_s": 60,
-              "healthy_reset_s": 60,
-              "srt_failure_threshold": 3,
-              "rtmp_hold_s": 60,
-              "rtmp_hold_max_s": 600,
-              "kill_grace_s": 5,
-          },
-          "streams": streams_list,
-      }
-
-      # Build YAML Header Comment
-      yaml_header = """# edge-relay stream configuration — the single source of truth.
+        # Build YAML Header
+        yaml_header = """# edge-relay stream configuration — the single source of truth.
 #
 # Validated on load and on every reload (SIGHUP, or simply saving this file
 # — changes are picked up automatically within ~1s via inotify). An invalid
@@ -402,23 +460,45 @@ with tab2:
 # first install) and edit it for your cameras.
 
 """
-      yaml_body = yaml.dump(
-          yaml_data, sort_keys=False, default_flow_style=False
-      )
-      full_yaml_str = yaml_header + yaml_body
+        yaml_body = yaml.dump(
+            yaml_data, sort_keys=False, default_flow_style=False
+        )
+        full_yaml_str = yaml_header + yaml_body
 
-      # 3. YAML Code Preview Section
-      st.markdown("### 📝 Step 2: Review Generated YAML Code")
-      st.code(full_yaml_str, language="yaml")
+        # YAML Preview
+        st.markdown("### 📝 Step 2: Generated YAML Code")
+        st.code(full_yaml_str, language="yaml")
 
-      # 4. Download Option
-      st.markdown("### 💾 Step 3: Download Configuration")
-      st.download_button(
-          label="📥 Download streams.yml",
-          data=full_yaml_str,
-          file_name="streams.yml",
-          mime="text/yaml",
-      )
+        # Download Section for both YAML and Excel
+        st.markdown("### 💾 Step 3: Download Verified Files")
+        dl_col1, dl_col2 = st.columns(2)
+
+        with dl_col1:
+          st.download_button(
+              label="📥 Download streams.yml",
+              data=full_yaml_str,
+              file_name="streams.yml",
+              mime="text/yaml",
+              use_container_width=True,
+          )
+
+        with dl_col2:
+          # Prepare Excel Download Buffer
+          excel_buffer = io.BytesIO()
+          with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            preview_df.to_excel(
+                writer, index=False, sheet_name="ValidatedStreams"
+            )
+
+          st.download_button(
+              label="📥 Download Validated Excel File",
+              data=excel_buffer.getvalue(),
+              file_name="validated_camera_config.xlsx",
+              mime=(
+                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              ),
+              use_container_width=True,
+          )
 
     except Exception as e:
       st.error(f"Error processing the Excel file: {str(e)}")
@@ -827,9 +907,7 @@ with tab3:
               "VLC may work but Edge/cloud pipeline may fail or require extra"
               " decoder support"
           ),
-          (
-              "Higher bandwidth/CPU/GPU load and more frames to process"
-          ),
+          "Higher bandwidth/CPU/GPU load and more frames to process",
           "Slower recovery after packet loss/reconnect",
           "Unexpected bandwidth spikes and buffering",
           "Latency, buffering, dropped frames",
@@ -950,85 +1028,5 @@ docker --version"""
     2. Copy/unpack the edge-relay directory into `~/Desktop/anvex/`.
     3. Place the validated `streams.yaml` at `~/Desktop/anvex/edge-relay/config/streams.yaml`.
     4. Run the `deploy.sh` or `install.sh`.
-    5. Review container/service logs and confirm all expected camera IDs start successfully.
+    5. Review container/service logs and confirm all expected camera IDs are streaming.
     """)
-
-  # 19. Post-Deployment Verification
-  st.markdown("### 19. Post-Deployment Verification")
-  st.markdown("""
-    1. Open the Edge Relay dashboard: `http://<server-ip>:8080/streams`
-    2. Confirm each Camera ID is present.
-    3. Confirm the source is receiving bytes and the stream is not repeatedly restarting.
-    4. Confirm RTMP output is reaching the Anvex media server.
-    5. Observe the stream for several minutes for stalls, reconnects, and unexpected latency.
-    6. Update the Excel inventory with **Deployment Status = Live** and record any remarks.
-    """)
-
-  # 20. Troubleshooting Matrix
-  st.markdown("### 20. Troubleshooting Matrix")
-  trouble_matrix_data = {
-      "Symptom": [
-          "VLC cannot open stream",
-          "401 Unauthorized",
-          "404 / path not found",
-          "Black screen",
-          "Video works in VLC but Edge Relay fails",
-          "Frequent restarts",
-          "Dashboard shows Connecting",
-          "Wrong camera appears",
-          "RTMP target unavailable",
-          "YAML rejected",
-      ],
-      "Likely Cause": [
-          "Wrong URL, credentials, port, path, or network",
-          "Invalid credentials / account permission",
-          "Wrong RTSP path",
-          "Unsupported codec/profile or wrong stream",
-          "Codec/transport/URL parsing difference",
-          "Network loss, high bitrate, stalls",
-          "Source unavailable or configuration error",
-          "Incorrect channel mapping",
-          "DNS/firewall/server issue",
-          "Indentation/syntax/invalid field",
-      ],
-      "Action": [
-          "Validate IP/port, credentials, URL path, and device access.",
-          "Verify username/password and RTSP permission.",
-          "Verify exact vendor/model/channel path.",
-          "Use H.264 and verify main/sub stream path.",
-          (
-              "Check H.264, TCP transport, password encoding, and relay"
-              " logs."
-          ),
-          "Use TCP, tune bitrate, verify bandwidth and camera stability.",
-          "Test same RTSP URL with VLC from the deployment machine.",
-          "Correct NVR/DVR channel and Camera ID mapping.",
-          "Check outbound network/DNS and Anvex media server status.",
-          "Validate YAML and compare against approved schema.",
-      ],
-  }
-  st.table(pd.DataFrame(trouble_matrix_data))
-
-  # 21. Pre-Deployment Checklist
-  st.markdown("### 21. Pre-Deployment Checklist")
-  checklist = [
-      "Client ID received and verified.",
-      "All agreed camera locations listed.",
-      "Camera/NVR/DVR IP addresses received.",
-      "RTSP port confirmed.",
-      "RTSP username/password received through approved secure method.",
-      "NVR/DVR credentials received if configuration access is required.",
-      "Channel numbers mapped to physical camera names.",
-      "Main RTSP URL identified.",
-      "Sub RTSP URL identified where required.",
-      "Every required RTSP feed tested successfully in VLC.",
-      "H.264 / FPS / GOP / bitrate / CBR settings checked.",
-      "CP Plus / vendor-specific settings checked where applicable.",
-      "Camera IDs assigned and frozen.",
-      "RTMP URLs generated from Client ID + Camera ID.",
-      "streams.yaml reviewed and validated.",
-      "Docker/Edge Relay host ready.",
-      "Network/firewall/DNS connectivity checked.",
-  ]
-  for item in checklist:
-    st.checkbox(item, key=f"chk_{hash(item)}")
